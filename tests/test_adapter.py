@@ -46,7 +46,9 @@ def test_buttons_and_timeouts():
     with pytest.raises(errors.PyppeteerError):
         _bridge.button("fourth")
     assert _bridge.ms({"timeout": 1500}) == 1.5
-    assert _bridge.ms({"timeout": 0}) > 3600  # 0 means no timeout
+    # 0 means no timeout: None, which the core's waits read as no limit
+    # (until 0.3.5 it was 24 hours).
+    assert _bridge.ms({"timeout": 0}) is None
 
 
 def test_engine_failures_become_pyppeteers_exceptions():
@@ -56,8 +58,18 @@ def test_engine_failures_become_pyppeteers_exceptions():
     assert isinstance(_bridge.translate(TargetClosedError("x")), errors.NetworkError)
     assert isinstance(_bridge.translate(ProtocolError("a: no response in 2s")),
                       errors.TimeoutError)
-    gone = _bridge.translate(ProtocolError("Failed to find execution context with id = 3"))
-    assert isinstance(gone, errors.ElementHandleError) and "id = 3" in str(gone)
+    # A vanished world comes typed from the core, and is pyppeteer's sentence.
+    from invisible_core.juggler.injected import ContextDestroyed
+    gone = _bridge.translate(ContextDestroyed("Execution context was destroyed"))
+    assert isinstance(gone, errors.ElementHandleError)
+    assert "most likely because of a navigation" in str(gone)
+    # Another document committed in ours' place: a failed navigation, in the
+    # core's words, which name both addresses (invisible-core 41.36.0).
+    from invisible_core.juggler.lifecycle import NavigationInterrupted
+    said = ('Navigation to "http://a/next" is interrupted by another '
+            'navigation to "http://a/landed"')
+    lost = _bridge.translate(NavigationInterrupted(said))
+    assert isinstance(lost, errors.PageError) and str(lost) == said
     assert issubclass(errors.TimeoutError, asyncio.TimeoutError)
 
 
@@ -85,32 +97,61 @@ def test_the_emitter_calls_plain_handlers_and_schedules_coroutines():
     assert ("plain", 3) in seen and ("coro", 3) in seen
 
 
-class _Frame:
-    def __init__(self, parent):
-        self.parent = parent
+def test_frames_are_the_lifecycles_and_their_events_its_announcements():
+    """The case measured on firefox-34, and again on firefox-41 for a parent
+    that moved to another process: the engine reports no detach for the old
+    document's iframe. The rule that a new document drops the old one's frames
+    is the core's now (`tests/test_a_frame_that_moves_keeps_its_state.py`
+    there); this page lists what the lifecycle holds and reports what it
+    announces, and the main frame re-announced by the move is not a new one."""
+    from invisible_core.juggler.connection import EventListeners
+    from invisible_core.juggler.lifecycle import Lifecycle
 
-
-class _Lifecycle:
-    def __init__(self):
-        self.frames = {"main": _Frame(None), "old-child": _Frame("main"),
-                       "old-grandchild": _Frame("old-child")}
-
-
-class _Engine:
-    def __init__(self):
-        self.lifecycle = _Lifecycle()
-        self.main_frame_id = "main"
-
-
-def test_a_committed_document_drops_the_frames_of_the_old_one():
-    """The case measured on firefox-34: a back-forward-cache navigation left the
-    old iframe in the lifecycle with a dead world, and it was listed."""
+    conn = EventListeners()
+    lifecycle = Lifecycle(conn, "S")
     page = Page.__new__(Page)
-    page._engine = _Engine()
+    page._engine = type("E", (), {"lifecycle": lifecycle, "main_frame_id": "main"})()
     page._frames = {}
-    page._gone = set()
-    page._forget_children("main")
-    # The new document's frame attaches after the commit.
-    page._engine.lifecycle.frames["new-child"] = _Frame("main")
-    listed = [f._id for f in page.frames]
-    assert listed == ["main", "new-child"]
+    emitted = []
+    page.emit_threadsafe = lambda name, frame: emitted.append((name, frame._id))
+    # The page is built after its main frame was seen, as in the engine.
+    conn.dispatch_event("Page.frameAttached", {"frameId": "main"}, "S")
+    lifecycle.announce = page._on_lifecycle
+    for method, params in [
+        ("Page.frameAttached", {"frameId": "old-child", "parentFrameId": "main"}),
+        ("Page.frameAttached", {"frameId": "main"}),
+        ("Page.navigationCommitted", {"frameId": "main", "navigationId": "n2",
+                                      "url": "http://b/"}),
+        ("Page.frameAttached", {"frameId": "new-child", "parentFrameId": "main"}),
+    ]:
+        conn.dispatch_event(method, params, "S")
+    assert [f._id for f in page.frames] == ["main", "new-child"]
+    assert emitted == [("frameattached", "old-child"),
+                       ("framedetached", "old-child"),
+                       ("frameattached", "new-child")], emitted
+
+
+@pytest.mark.parametrize("raised, said", [
+    ("interrupted", 'Navigation to "http://a/next" is interrupted by another '
+                    'navigation to "http://a/landed"'),
+    ("aborted", "NS_ERROR_UNKNOWN_HOST at http://a/next"),
+])
+def test_goto_words_an_interruption_once_and_an_abort_with_its_url(raised, said):
+    """An abort is the engine's error text, and goto adds the address as
+    pyppeteer does ("net::ERR_... at <url>"). An interruption already names
+    both addresses, and adding the url again would say it twice."""
+    from invisible_core.juggler.lifecycle import NavigationError, NavigationInterrupted
+
+    error = (NavigationInterrupted(said) if raised == "interrupted"
+             else NavigationError("NS_ERROR_UNKNOWN_HOST"))
+
+    def goto(url, **kwargs):
+        raise error
+
+    page = Page.__new__(Page)
+    page._engine = type("E", (), {"lifecycle": type("L", (), {
+        "goto": staticmethod(goto)})(), "main_frame_id": "main"})()
+    page._navigation_timeout_s = 5
+    with pytest.raises(errors.PageError) as e:
+        asyncio.run(page.goto("http://a/next"))
+    assert str(e.value) == said
