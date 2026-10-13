@@ -2,6 +2,62 @@
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-13
+
+The pin moves to invisible-core 44.39.0, which seals the firefox-44 engine.
+
+### Changed
+- **`waitUntil="networkidle2"` is pyppeteer's**: at most two requests in
+  flight for 500 ms. It waited for none, so a page that keeps two requests
+  open timed out.
+- **Navigation waits are decided as pyppeteer's `NavigatorWatcher`** in
+  `goto`, `waitForNavigation`, `reload`, `goBack` and `goForward`:
+  - a document that commits in place of the one asked for is waited on in
+    its place, and nothing raises; it was `PageError` "is interrupted by
+    another navigation";
+  - the answer is the response of the document the wait ended on
+    (pyppeteer's `mainFrame._navigationURL`); it was always the first
+    document's;
+  - the expected event is waited for on the child frames too, those that
+    started loading: `domcontentloaded` waits for an iframe's document, and
+    a lazy iframe out of view, which never starts, is not waited for.
+- **Four errors are pyppeteer's**: `page.type` on a selector that matches
+  nothing is `PageError` "Cannot find #x on this page"; a key that is not on
+  the layout is `PyppeteerError` "Unknown key: X" (it was the engine's
+  `ValueError`); handling a request with interception off says "Request
+  interception is not enabled."; closing the default context says
+  "Non-incognito profile cannot be closed".
+
+### Fixed
+- **A cookie that declared no `sameSite` has none in `cookies()`**, as
+  Chrome's cookie objects; every cookie carried `sameSite: "None"`.
+- **Text with a character that has no key** (an accented letter, an emoji)
+  is typed as pyppeteer types it: the keys that exist are pressed and the
+  character is inserted in its place. `keyboard.type(text, delay=N)`
+  raised, and without a delay the whole text was inserted with no
+  keystroke.
+- **On Linux, the line endings a page reads are Windows'**: a `Blob` or a
+  `File` made with `endings: "native"` turns `\n` into `\r\n`, and the text
+  of a selection across two blocks is joined by `\r\n`, as on Windows.
+- **`speechSynthesis.getVoices()` is Windows' list**: David, Mark, Zira and
+  the two Desktop voices, in that order, and none of them is the default.
+
+### Not yet as the original
+- `keyboard.press(key, text=...)` and `down(key, text=...)` ignore `text`:
+  the engine turns a key event that carries another text into an input
+  method composition (the page sees the key "Process"), which no keyboard
+  sends, so the option waits for the engine.
+- `browser.disconnect()` closes the browser, where pyppeteer leaves it
+  running.
+- Where Firefox and pyppeteer's Chromium fire different events, the same
+  rule ends in a different place. A page that replaces itself in its head
+  (`location.replace`): Chromium fires the first page's `load` before the
+  second commits, so pyppeteer answers the first page; Firefox fires none,
+  so `goto` answers the second. A script navigation of the page being left
+  while a `goto` is on its way: Chromium drops it, Firefox lets it replace
+  the `goto`, which then ends on it.
+- A `goto` to a `data:` URL emits no `request` event; pyppeteer's does.
+
 ## [0.5.0] - 2026-10-13
 
 The pin moves to invisible-core 43.39.0, which seals the firefox-43 engine:

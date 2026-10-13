@@ -20,18 +20,29 @@ from . import _bridge, errors
 from ._events import EventEmitter
 from invisible_core.juggler.deadline import Deadline
 from invisible_core.juggler.injected import ContextDestroyed
-from invisible_core.juggler.lifecycle import NavigationError, NavigationInterrupted
+from invisible_core.juggler.keyboard import UnknownKey
+from invisible_core.juggler.lifecycle import NavigationError
 from .element_handle import ElementHandle, JSHandle
+
+#: How every navigation wait here is decided: pyppeteer's `NavigatorWatcher`
+#: completes when the frame carries a document other than the one it had when
+#: the wait began and that document and every child frame have the expected
+#: events (`_checkLifecycleComplete`, `_checkLifecycle`). It never says
+#: interrupted. The core counts only the children that have started loading,
+#: puppeteer's own later rule: a lazy iframe out of view never starts.
+_FOLLOW = {"replaced": "follow", "children": True}
 
 #: pyppeteer's `waitUntil` values (`pyppeteerToProtocolLifecycle`), as the
 #: engine's load states. `documentloaded` is pyppeteer's old name, accepted
-#: with a warning. `networkidle2` is "at most two requests for 500 ms" in
-#: pyppeteer and the engine's networkidle is zero, so it waits longer than
-#: pyppeteer does on a page that keeps a request open.
+#: with a warning. `networkidle2` is the engine's own networkidle2, "at most
+#: two requests for 500 ms" as in pyppeteer; until 0.5.0 it was networkidle,
+#: none in flight, and a page that keeps two requests open never reached it.
 _WAIT_UNTIL = {"load": "load", "domcontentloaded": "domcontentloaded",
                "documentloaded": "domcontentloaded",
-               "networkidle0": "networkidle", "networkidle2": "networkidle"}
-_ORDER = ["commit", "domcontentloaded", "load", "networkidle"]
+               "networkidle0": "networkidle", "networkidle2": "networkidle2"}
+#: networkidle implies networkidle2 (none in flight is at most two), so it is
+#: the later of the two.
+_ORDER = ["commit", "domcontentloaded", "load", "networkidle2", "networkidle"]
 
 
 def _state(options: dict) -> str:
@@ -412,7 +423,12 @@ class Frame:
         await (await self._element(selector)).tap()
 
     async def type(self, selector: str, text: str, options: dict = None, **kwargs: Any) -> None:
-        await (await self._element(selector)).type(text, options, **kwargs)
+        # pyppeteer's `Frame.type` has its own sentence; click, hover and tap
+        # say "No node found for selector" (`_element`).
+        element = await self.querySelector(selector)
+        if element is None:
+            raise errors.PageError("Cannot find %s on this page" % selector)
+        await element.type(text, options, **kwargs)
 
     async def select(self, selector: str, *values: str) -> List[str]:
         """Chooses the options with these values and returns the values now
@@ -643,29 +659,40 @@ class Keyboard:
     def _kb(self):
         return self._page._engine.actions.keyboard
 
+    @staticmethod
+    def _on_key(call, key: str, **kwargs: Any) -> None:
+        """A keyboard call naming `key`, with pyppeteer's error for a key
+        that is not on the layout: PyppeteerError "Unknown key: X", the base
+        class (`input.py`). Until 0.6.0 the core's ValueError came through."""
+        try:
+            call(key, **kwargs)
+        except UnknownKey:
+            raise errors.PyppeteerError("Unknown key: %s" % key) from None
+
     async def down(self, key: str, options: dict = None, **kwargs: Any) -> None:
-        await _bridge.run(self._kb.down, key)
+        await _bridge.run(self._on_key, self._kb.down, key)
 
     async def up(self, key: str) -> None:
-        await _bridge.run(self._kb.up, key)
+        await _bridge.run(self._on_key, self._kb.up, key)
 
     async def sendCharacter(self, char: str) -> None:
         await _bridge.run(self._kb.insert_text, char)
 
     async def type(self, text: str, options: Dict = None, **kwargs: Any) -> None:
         """Types text. Without ``delay`` the gaps between keys are the
-        session's typing rhythm; with it, that many milliseconds each."""
+        session's typing rhythm; with it, that many milliseconds each. A
+        character the layout has no key for is inserted, never refused, as
+        pyppeteer's `sendCharacter` does for it: the core's `_type` is the
+        one place that decides how. Until 0.6.0 the `delay` path refused it."""
         options = _bridge.merge(options, kwargs)
         delay = options.get("delay")
-        actions = self._page._engine.actions
-        if delay:
-            await _bridge.run(self._kb.type, text, delay_ms=float(delay))
-        else:
-            await _bridge.run(actions._type, text)
+        await _bridge.run(self._page._engine.actions._type, text,
+                          float(delay) if delay else None)
 
     async def press(self, key: str, options: Dict = None, **kwargs: Any) -> None:
         options = _bridge.merge(options, kwargs)
-        await _bridge.run(self._kb.press, key, dwell_ms=options.get("delay"))
+        await _bridge.run(self._on_key, self._kb.press, key,
+                          dwell_ms=options.get("delay"))
 
 
 class Mouse:
@@ -780,6 +807,9 @@ class ConsoleMessage:
         return self._args
 
 
+_NOT_INTERCEPTING = "Request interception is not enabled."
+
+
 class Request:
     def __init__(self, page: "Page", params: dict) -> None:
         self._page = page
@@ -841,14 +871,16 @@ class Request:
     def failure(self) -> Optional[Dict]:
         return {"errorText": self._failure} if self._failure else None
 
+    # pyppeteer's sentence for all three (`network_manager.py`); until 0.6.0
+    # it ended in "!", puppeteer's.
     async def continue_(self, overrides: Dict = None) -> None:
-        raise errors.NetworkError("Request interception is not enabled!")
+        raise errors.NetworkError(_NOT_INTERCEPTING)
 
     async def respond(self, response: Dict) -> None:
-        raise errors.NetworkError("Request interception is not enabled!")
+        raise errors.NetworkError(_NOT_INTERCEPTING)
 
     async def abort(self, errorCode: str = "failed") -> None:
-        raise errors.NetworkError("Request interception is not enabled!")
+        raise errors.NetworkError(_NOT_INTERCEPTING)
 
 
 class Response:
@@ -1195,12 +1227,16 @@ class Page(EventEmitter):
         engine = self._engine
 
         def run():
+            # ⛔ `_FOLLOW`, and the answer is the response of the document the
+            # wait ended on (`requests.get(mainFrame._navigationURL)`). Until
+            # 0.6.0 a replacement before commit was PageError "interrupted",
+            # the response was the first document's after the page replaced
+            # itself, and the children were not waited for.
             try:
                 return engine.lifecycle.goto(url, frame_id=engine.main_frame_id,
                                              until=state, timeout=timeout,
-                                             referer=options.get("referer"))
-            except NavigationInterrupted:
-                raise  # worded by `_bridge.translate`
+                                             referer=options.get("referer"),
+                                             **_FOLLOW)
             except NavigationError as e:
                 raise errors.PageError("%s at %s" % (e, url)) from None
             except TimeoutError:
@@ -1208,7 +1244,7 @@ class Page(EventEmitter):
                     "Navigation Timeout Exceeded: %s ms exceeded."
                     % int(timeout * 1000)) from None
         result = await _bridge.run(run)
-        return self._navigation_response(result.get("navigationId"))
+        return self._navigation_response(result.get("landed"))
 
     async def _history(self, command: str, options: dict) -> Optional[Response]:
         state = _state(options)
@@ -1229,7 +1265,7 @@ class Page(EventEmitter):
             # timeout and every timeout, the second case too, answered None.
             try:
                 return engine.lifecycle.wait_for_new_navigation(
-                    fid, since, state, timeout=timeout)
+                    fid, since, state, timeout=timeout, **_FOLLOW)
             except TimeoutError:
                 raise errors.TimeoutError(
                     "Navigation Timeout Exceeded: %s ms exceeded."
@@ -1263,7 +1299,7 @@ class Page(EventEmitter):
         def run():
             try:
                 return engine.lifecycle.wait_for_new_navigation(
-                    fid, since, state, timeout=timeout)
+                    fid, since, state, timeout=timeout, **_FOLLOW)
             except TimeoutError:
                 raise errors.TimeoutError(
                     "Navigation Timeout Exceeded: %s ms exceeded."
@@ -1313,6 +1349,11 @@ class Page(EventEmitter):
             if any(_sent_to(c, url) for url in urls):
                 item = dict(c)
                 item.setdefault("size", len(c.get("name", "")) + len(c.get("value", "")))
+                # The engine says "None" for a cookie that declared nothing;
+                # Chrome's object has no `sameSite` then (measured on
+                # pyppeteer's Chromium). Until 0.6.0 every cookie carried it.
+                if item.get("sameSite") == "None":
+                    del item["sameSite"]
                 out.append(item)
         return out
 
