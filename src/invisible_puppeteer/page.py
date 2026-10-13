@@ -10,35 +10,83 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import mimetypes
 import time
+import urllib.parse
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
 
 from . import _bridge, errors
 from ._events import EventEmitter
-from invisible_core.juggler import domain_matches, host_of
 from invisible_core.juggler.deadline import Deadline
 from invisible_core.juggler.injected import ContextDestroyed
 from invisible_core.juggler.lifecycle import NavigationError, NavigationInterrupted
 from .element_handle import ElementHandle, JSHandle
 
-#: pyppeteer's `waitUntil` values, as the engine's four load states.
+#: pyppeteer's `waitUntil` values (`pyppeteerToProtocolLifecycle`), as the
+#: engine's load states. `documentloaded` is pyppeteer's old name, accepted
+#: with a warning. `networkidle2` is "at most two requests for 500 ms" in
+#: pyppeteer and the engine's networkidle is zero, so it waits longer than
+#: pyppeteer does on a page that keeps a request open.
 _WAIT_UNTIL = {"load": "load", "domcontentloaded": "domcontentloaded",
-               "networkidle0": "networkidle", "networkidle2": "networkidle",
-               "commit": "commit"}
+               "documentloaded": "domcontentloaded",
+               "networkidle0": "networkidle", "networkidle2": "networkidle"}
 _ORDER = ["commit", "domcontentloaded", "load", "networkidle"]
 
 
-def _state(wait_until) -> str:
-    """One engine state for a pyppeteer `waitUntil`, which may be a list: the
-    latest of them, since waiting for it waits for the others too."""
-    names = wait_until if isinstance(wait_until, (list, tuple)) else [wait_until or "load"]
+def _state(options: dict) -> str:
+    """One engine state for a navigation's options, validated as pyppeteer's
+    `NavigatorWatcher._validate_options` does, before anything is sent: the
+    same errors in the same order, and the latest of the states asked for,
+    since waiting for it waits for the others too."""
+    if "networkIdleTimeout" in options:
+        raise ValueError("`networkIdleTimeout` option is no longer supported.")
+    if "networkIdleInflight" in options:
+        raise ValueError("`networkIdleInflight` option is no longer supported.")
+    if options.get("waitUntil") == "networkidle":
+        # pyppeteer's words, its spelling included.
+        raise ValueError("`networkidle` option is no logner supported. "
+                         "Use `networkidle2` instead.")
+    if options.get("waitUntil") == "documentloaded":
+        logging.getLogger(__name__).warning(
+            "`documentloaded` option is no longer supported. "
+            "Use `domcontentloaded` instead.")
+    wait_until = options.get("waitUntil", "load")
+    if isinstance(wait_until, list):
+        names = wait_until
+    elif isinstance(wait_until, str):
+        names = [wait_until]
+    else:
+        raise TypeError("`waitUntil` option should be str or list of str, "
+                        "but got type %s" % type(wait_until))
     states = []
     for name in names:
         if name not in _WAIT_UNTIL:
             raise ValueError("Unknown value for options.waitUntil: %s" % name)
         states.append(_WAIT_UNTIL[name])
     return max(states, key=_ORDER.index)
+
+
+def _sent_to(cookie: dict, url: str) -> bool:
+    """Would this cookie be sent to `url`? RFC 6265 section 5.4, which is how
+    Chrome's `Network.getCookies` and `Network.deleteCookies` read a URL for
+    pyppeteer: a host-only cookie on its host alone and a domain cookie
+    (leading dot) on it and its subdomains; the path equal or a prefix that
+    ends at a '/'; a `secure` cookie only to https."""
+    parts = urllib.parse.urlsplit(url)
+    host = (parts.hostname or "").lower()
+    path = parts.path or "/"
+    domain = (cookie.get("domain") or "").lower()
+    if domain.startswith("."):
+        if host != domain[1:] and not host.endswith(domain):
+            return False
+    elif host != domain:
+        return False
+    cpath = cookie.get("path") or "/"
+    if path != cpath and not (path.startswith(cpath) and
+                              (cpath.endswith("/") or path[len(cpath)] == "/")):
+        return False
+    return not (cookie.get("secure") and parts.scheme != "https")
 
 
 class ExecutionContext:
@@ -69,6 +117,16 @@ class Frame:
         self._page = page
         self._id = frame_id
         self._execution_context = ExecutionContext(self)
+        #: The lifecycle's frame, held: it outlives the frame's detachment,
+        #: so a detached frame still says its url and name, as pyppeteer's.
+        self._known = page._engine.lifecycle.frame(frame_id)
+
+    def _current(self):
+        """The lifecycle's frame while it is attached, else the last one."""
+        frame = self._engine.lifecycle.frame(self._id)
+        if frame is not None:
+            self._known = frame
+        return self._known
 
     # ── identity ────────────────────────────────────────────────────────────
     @property
@@ -77,12 +135,11 @@ class Frame:
 
     @property
     def name(self) -> str:
-        return ""
+        return getattr(self._current(), "name", "") or ""
 
     @property
     def url(self) -> str:
-        frame = self._engine.lifecycle.frame(self._id)
-        return getattr(frame, "url", "") or ""
+        return getattr(self._current(), "url", "") or ""
 
     @property
     def parentFrame(self) -> Optional["Frame"]:
@@ -244,30 +301,101 @@ class Frame:
     async def title(self) -> str:
         return await _bridge.run(lambda: self._engine.injected.title(self._id)) or ""
 
+    # pyppeteer's page functions for the two tags (frame_manager.py), as they
+    # are: a tag by `url` resolves once it has loaded and rejects when it does
+    # not; a script by content throws an error its `onerror` saw at once.
+    _ADD_SCRIPT_URL = """async function addScriptUrl(url, type) {
+    const script = document.createElement('script');
+    script.src = url;
+    if (type)
+        script.type = type;
+    const promise = new Promise((res, rej) => {
+        script.onload = res;
+        script.onerror = rej;
+    });
+    document.head.appendChild(script);
+    await promise;
+    return script;
+}"""
+    _ADD_SCRIPT_CONTENT = """function addScriptContent(content, type = 'text/javascript') {
+    const script = document.createElement('script');
+    script.type = type;
+    script.text = content;
+    let error = null;
+    script.onerror = e => error = e;
+    document.head.appendChild(script);
+    if (error)
+        throw error;
+    return script;
+}"""
+    _ADD_STYLE_URL = """async function (url) {
+    const link = document.createElement('link');
+    link.rel = 'stylesheet';
+    link.href = url;
+    const promise = new Promise((res, rej) => {
+        link.onload = res;
+        link.onerror = rej;
+    });
+    document.head.appendChild(link);
+    await promise;
+    return link;
+}"""
+    _ADD_STYLE_CONTENT = """async function (content) {
+    const style = document.createElement('style');
+    style.type = 'text/css';
+    style.appendChild(document.createTextNode(content));
+    const promise = new Promise((res, rej) => {
+        style.onload = res;
+        style.onerror = rej;
+    });
+    document.head.appendChild(style);
+    await promise;
+    return style;
+}"""
+
     async def addScriptTag(self, options: Dict = None, **kwargs: str) -> ElementHandle:
+        """pyppeteer's `addScriptTag`: by `url` it waits for the script to
+        load and raises PageError when it does not; by `path` or `content`
+        the tag is `text/javascript` unless `type` says otherwise."""
         options = _bridge.merge(options, kwargs)
-        content = options.get("content")
-        if options.get("path"):
-            with open(options["path"], "r", encoding="utf-8") as f:
-                content = f.read() + "\n//# sourceURL=" + options["path"]
-        return await self.evaluateHandle(
-            "(url, content, type) => { const s = document.createElement('script');"
-            " if (type) s.type = type; if (url) s.src = url; else s.text = content;"
-            " document.head.appendChild(s); return s; }",
-            options.get("url"), content, options.get("type"))
+        if isinstance(options.get("url"), str):
+            url = options["url"]
+            args = [url] + ([options["type"]] if "type" in options else [])
+            try:
+                return await self.evaluateHandle(self._ADD_SCRIPT_URL, *args)
+            except errors.ElementHandleError as e:
+                raise errors.PageError("Loading script from %s failed" % url) from e
+        if isinstance(options.get("path"), str):
+            with open(options["path"], encoding="utf-8") as f:
+                contents = f.read()
+            contents += "//# sourceURL=%s" % options["path"].replace("\n", "")
+            args = [contents] + ([options["type"]] if "type" in options else [])
+            return await self.evaluateHandle(self._ADD_SCRIPT_CONTENT, *args)
+        if isinstance(options.get("content"), str):
+            args = [options["content"]] + ([options["type"]] if "type" in options else [])
+            return await self.evaluateHandle(self._ADD_SCRIPT_CONTENT, *args)
+        raise ValueError(
+            "Provide an object with a `url`, `path` or `content` property")
 
     async def addStyleTag(self, options: Dict = None, **kwargs: str) -> ElementHandle:
+        """pyppeteer's `addStyleTag`: the tag resolves once its stylesheet has
+        loaded, and by `url` a stylesheet that does not load is PageError."""
         options = _bridge.merge(options, kwargs)
-        content = options.get("content")
-        if options.get("path"):
-            with open(options["path"], "r", encoding="utf-8") as f:
-                content = f.read()
-        return await self.evaluateHandle(
-            "(url, content) => { let el; if (url) { el = document.createElement('link');"
-            " el.rel = 'stylesheet'; el.href = url; } else {"
-            " el = document.createElement('style'); el.textContent = content; }"
-            " document.head.appendChild(el); return el; }",
-            options.get("url"), content)
+        if isinstance(options.get("url"), str):
+            url = options["url"]
+            try:
+                return await self.evaluateHandle(self._ADD_STYLE_URL, url)
+            except errors.ElementHandleError as e:
+                raise errors.PageError("Loading style from %s failed" % url) from e
+        if isinstance(options.get("path"), str):
+            with open(options["path"], encoding="utf-8") as f:
+                contents = f.read()
+            contents += "/*# sourceURL=%s*/" % options["path"].replace("\n", "")
+            return await self.evaluateHandle(self._ADD_STYLE_CONTENT, contents)
+        if isinstance(options.get("content"), str):
+            return await self.evaluateHandle(self._ADD_STYLE_CONTENT, options["content"])
+        raise ValueError(
+            "Provide an object with a `url`, `path` or `content` property")
 
     # ── acting through a selector ───────────────────────────────────────────
     async def click(self, selector: str, options: dict = None, **kwargs: Any) -> None:
@@ -287,47 +415,158 @@ class Frame:
         await (await self._element(selector)).type(text, options, **kwargs)
 
     async def select(self, selector: str, *values: str) -> List[str]:
-        """Chooses the options with these values, with trusted input/change
-        events, and returns the values now selected."""
-        element = await self._element(selector)
-        tag = await element._read("(el) => (el.localName || '').toLowerCase()")
-        if tag != "select":
-            raise errors.ElementHandleError("Element is not a <select> element.")
-        await _bridge.run(element._act, "select_option",
-                          [{"value": str(v)} for v in values])
+        """Chooses the options with these values and returns the values now
+        selected, as pyppeteer's `select`: every value must be a string, an
+        unknown value is ignored, the first match only unless the select is
+        `multiple`, and nothing matching leaves nothing selected. No check
+        that the select is visible or enabled: a hidden native select behind
+        a styled widget is the ordinary case.
+
+        ⛔ ONE DEPARTURE: the engine selects through the dropdown's own path,
+        so `input` and `change` are trusted and fire when the selection
+        changed. pyppeteer dispatches both from the page, untrusted, every
+        time - the signal [B175] removed."""
+        for value in values:
+            if not isinstance(value, str):
+                raise TypeError("Values must be string. Found %s of type %s"
+                                % (value, type(value)))
+        element = await self.querySelector(selector)
+        if element is None:
+            raise errors.ElementHandleError(
+                'Error: failed to find element matching selector "%s"' % selector)
+        indices = await element._read(
+            "(el, values) => { if (el.nodeName.toLowerCase() !== 'select') return null;"
+            " const out = []; const options = Array.from(el.options);"
+            " for (let i = 0; i < options.length; i++) {"
+            "  if (values.includes(options[i].value)) {"
+            "   out.push(i); if (!el.multiple) break; } }"
+            " return out; }", list(values))
+        if indices is None:
+            raise errors.ElementHandleError(
+                "Evaluation failed: Error: Element is not a <select> element.")
+        await _bridge.run(lambda: self._engine.send(
+            "Page.selectOptions", {"frameId": self._id, "objectId": element._oid,
+                                   "indices": indices}))
         return await element._read(
             "(el) => Array.from(el.options).filter(o => o.selected).map(o => o.value)")
 
-    # ── waiting ─────────────────────────────────────────────────────────────
-    async def waitForSelector(self, selector: str, options: dict = None, **kwargs: Any):
-        return await self._wait_for_element("css", selector, _bridge.merge(options, kwargs))
+    # ── waiting ─────────────────────────────────────────────────────────────────────
+    #: pyppeteer's selector predicate inside its polling page function
+    #: (frame_manager.py, `_waitForSelectorOrXPath` and
+    #: `waitForPredicatePageFunction`), as one function the UTILITY world
+    #: runs: polling on animation frames when visibility is asked, on DOM
+    #: mutations otherwise, and resolving undefined when its own timer runs
+    #: out. In the utility world the page sees no MutationObserver and no
+    #: requestAnimationFrame of its own being called.
+    _WAIT_FOR_SELECTOR = """async (selectorOrXPath, isXPath, waitForVisible, waitForHidden, polling, timeout) => {
+  const predicate = () => {
+    const node = isXPath
+        ? document.evaluate(selectorOrXPath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue
+        : document.querySelector(selectorOrXPath);
+    if (!node)
+      return waitForHidden;
+    if (!waitForVisible && !waitForHidden)
+      return node;
+    const element = node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
+    const style = window.getComputedStyle(element);
+    const rect = element.getBoundingClientRect();
+    const isVisible = style && style.visibility !== 'hidden' &&
+        !!(rect.top || rect.bottom || rect.width || rect.height);
+    const success = (waitForVisible === isVisible || waitForHidden === !isVisible);
+    return success ? node : null;
+  };
+  let timedOut = false;
+  if (timeout)
+    setTimeout(() => timedOut = true, timeout);
+  const first = predicate();
+  if (first)
+    return first;
+  return await new Promise(fulfill => {
+    if (polling === 'raf') {
+      const onRaf = () => {
+        if (timedOut)
+          return fulfill();
+        const success = predicate();
+        if (success)
+          return fulfill(success);
+        requestAnimationFrame(onRaf);
+      };
+      requestAnimationFrame(onRaf);
+      return;
+    }
+    const observer = new MutationObserver(() => {
+      if (timedOut) {
+        observer.disconnect();
+        return fulfill();
+      }
+      const success = predicate();
+      if (success) {
+        observer.disconnect();
+        fulfill(success);
+      }
+    });
+    observer.observe(document, {childList: true, subtree: true, attributes: true});
+    if (timeout)
+      setTimeout(() => { observer.disconnect(); fulfill(); }, timeout);
+  });
+}"""
 
-    async def waitForXPath(self, xpath: str, options: dict = None, **kwargs: Any):
-        return await self._wait_for_element("xpath", xpath, _bridge.merge(options, kwargs))
+    # ⛔ NOT `async def`, AS IN PYPPETEER: the wait starts when it is CALLED,
+    # so `w = frame.waitForSelector(...)` sees an element that comes and goes
+    # before `await w`. Until 0.4.0 nothing ran until the await.
+    #
+    # ⛔ AND ON THE BROWSER'S LOOP, as pyppeteer's `WaitTask` creates its task
+    # on its connection's loop: a call made with no loop running (the
+    # `loop.run_until_complete(page.waitForSelector(...))` of a synchronous
+    # caller) belongs to the loop the browser was launched on, not to a new
+    # one `asyncio` would make up.
+    def waitForSelector(self, selector: str, options: dict = None, **kwargs: Any) -> Awaitable:
+        return self._page._loop.create_task(
+            self._wait_for_element("css", selector, _bridge.merge(options, kwargs)))
+
+    def waitForXPath(self, xpath: str, options: dict = None, **kwargs: Any) -> Awaitable:
+        return self._page._loop.create_task(
+            self._wait_for_element("xpath", xpath, _bridge.merge(options, kwargs)))
 
     async def _wait_for_element(self, by: str, value: str, options: dict):
+        """pyppeteer's `WaitTask` for a selector or an XPath: the element, or
+        with `hidden` the element still there but hidden, or a handle to
+        `true` when it is gone; again in the new document when the frame
+        navigates; PageError when the frame is detached."""
+        timeout = options.get("timeout", 30000)
         visible = bool(options.get("visible"))
         hidden = bool(options.get("hidden"))
-        deadline = Deadline(_bridge.ms(options))
+        polling = "raf" if visible or hidden else "mutation"
+        title = '%s "%s"%s' % ("XPath" if by == "xpath" else "selector", value,
+                               " to be hidden" if hidden else "")
+        deadline = Deadline(timeout / 1000.0 if timeout else None)
         engine = self._engine
-        while True:
-            found = await self._query(None, by, value)
-            element = found[0] if found else None
-            shown = False
-            if element is not None and (visible or hidden):
-                shown = await _bridge.run(engine.injected.element_state,
-                                          self._id, element._oid, "visible")
-            if hidden:
-                if element is None or not shown:
+
+        def run():
+            while True:
+                if engine.lifecycle.frame(self._id) is None:
+                    raise errors.PageError("waitForFunction failed: frame got detached.")
+                left = deadline.left()
+                if left is not None and left <= 0:
                     return None
-            elif element is not None and (not visible or shown):
-                return element
-            if deadline.passed():
-                what = "selector" if by == "css" else "XPath"
-                raise errors.TimeoutError(
-                    'Waiting for %s "%s" failed: timeout %sms exceeds.'
-                    % (what, value, int(options.get("timeout", 30000))))
-            await asyncio.sleep(0.1)
+                try:
+                    ctx = engine.injected.context_id(self._id)
+                    return engine.injected.call_raw(
+                        ctx, self._WAIT_FOR_SELECTOR,
+                        [{"value": value}, {"value": by == "xpath"},
+                         {"value": visible}, {"value": hidden},
+                         {"value": polling},
+                         {"value": 0 if left is None else max(1, int(left * 1000))}],
+                        by_value=False, timeout=None)
+                except ContextDestroyed:
+                    continue  # the document went: ask the next one
+        remote = await _bridge.run(run)
+        if not remote or remote.get("type") == "undefined":
+            raise errors.TimeoutError(
+                "Waiting for %s failed: timeout %sms exceeds." % (title, timeout))
+        if remote.get("subtype") == "node" and remote.get("objectId"):
+            return ElementHandle(self, remote["objectId"])
+        return JSHandle(self, remote.get("objectId") or "", remote)
 
     async def waitForFunction(self, pageFunction: str, options: dict = None,
                               *args: Any, **kwargs: Any) -> JSHandle:
@@ -351,7 +590,10 @@ class Frame:
             # ⛔ A NAVIGATION DOES NOT END THE WAIT: pyppeteer's WaitTask runs
             # again in the new document. The predicate is sent once per turn,
             # and a world that went under it means the next turn asks the new
-            # document ([B285]).
+            # document ([B285]). A frame that is gone ends it, in pyppeteer's
+            # words (`WaitTask` on `_detach`).
+            if self._engine.lifecycle.frame(self._id) is None:
+                raise errors.PageError("waitForFunction failed: frame got detached.")
             try:
                 remote = self._evaluate_sync(pageFunction, args, by_value=False,
                                              force_expr=False)
@@ -809,6 +1051,10 @@ class Page(EventEmitter):
             frame = self._frames.pop(frame_id, None)
             if frame is not None:
                 self.emit_threadsafe("framedetached", frame)
+        elif what == "sameDocument":
+            # pyppeteer emits `framenavigated` for a same-document
+            # navigation too (`_onFrameNavigatedWithinDocument`).
+            self.emit_threadsafe("framenavigated", self._frame(frame_id))
 
     def _navigation_response(self, navigation_id: Optional[str]) -> Optional[Response]:
         if not navigation_id:
@@ -844,7 +1090,8 @@ class Page(EventEmitter):
     @property
     def viewport(self) -> Optional[Dict]:
         if self._viewport is not None:
-            return dict(self._viewport)
+            # The very dict the caller passed, as pyppeteer's `page.viewport`.
+            return self._viewport
         vp = (self._context._engine.options or {}).get("viewport")
         return dict(vp) if vp else None
 
@@ -942,7 +1189,7 @@ class Page(EventEmitter):
         """Navigates and waits for ``waitUntil`` (default ``load``); answers
         with the main document's Response."""
         options = _bridge.merge(options, kwargs)
-        state = _state(options.get("waitUntil"))
+        state = _state(options)
         timeout = (_bridge.ms(options) if "timeout" in options
                    else self._navigation_timeout_s)
         engine = self._engine
@@ -964,7 +1211,7 @@ class Page(EventEmitter):
         return self._navigation_response(result.get("navigationId"))
 
     async def _history(self, command: str, options: dict) -> Optional[Response]:
-        state = _state(options.get("waitUntil"))
+        state = _state(options)
         timeout = (_bridge.ms(options) if "timeout" in options
                    else self._navigation_timeout_s)
         engine = self._engine
@@ -1004,7 +1251,7 @@ class Page(EventEmitter):
         call - the pattern is `asyncio.gather(page.waitForNavigation(),
         page.click(...))`, as in pyppeteer."""
         options = _bridge.merge(options, kwargs)
-        state = _state(options.get("waitUntil"))
+        state = _state(options)
         timeout = (_bridge.ms(options) if "timeout" in options
                    else self._navigation_timeout_s)
         engine = self._engine
@@ -1056,52 +1303,75 @@ class Page(EventEmitter):
 
     # ── cookies ─────────────────────────────────────────────────────────────
     async def cookies(self, *urls: str) -> List[Dict[str, Union[str, int, bool]]]:
-        """The cookies for these URLs (the page's URL when none is given)."""
+        """The cookies that would be sent to these URLs (the page's URL when
+        none is given), as Chrome's `Network.getCookies` answers pyppeteer:
+        by domain, path and `secure` (`_sent_to`)."""
         urls = urls or (self.url,)
-        engine_context = self._context._engine
-        all_cookies = await _bridge.run(engine_context.cookies)
+        all_cookies = await _bridge.run(self._context._engine.cookies)
         out = []
         for c in all_cookies:
-            for url in urls:
-                if domain_matches(c.get("domain") or "", host_of(url)):
-                    item = dict(c)
-                    item.setdefault("size", len(c.get("name", "")) + len(c.get("value", "")))
-                    out.append(item)
-                    break
+            if any(_sent_to(c, url) for url in urls):
+                item = dict(c)
+                item.setdefault("size", len(c.get("name", "")) + len(c.get("value", "")))
+                out.append(item)
         return out
 
     async def setCookie(self, *cookies: dict) -> None:
+        """pyppeteer's `setCookie`: a cookie with no `url` takes the page's
+        when the page is http(s); a blank page or a data: URL cannot have one;
+        each cookie is deleted first, as pyppeteer does, so on a page that is
+        not http(s) a cookie with neither url nor domain is that deletion's
+        protocol error."""
         page_url = self.url
         items = []
         for cookie in cookies:
             item = dict(cookie)
-            if "name" not in item or "value" not in item:
-                raise errors.PageError("A cookie needs a name and a value")
-            if not item.get("url") and not item.get("domain"):
-                if not page_url.startswith("http"):
-                    raise errors.PageError(
-                        'At least one of the url and domain needs to be specified')
+            if "url" not in item and page_url.startswith("http"):
                 item["url"] = page_url
-            if item.get("url") and item["url"].startswith("about:"):
-                raise errors.PageError('Blank page can not have cookie "%s"' % item["name"])
+            if item.get("url") == "about:blank":
+                raise errors.PageError('Blank page can not have cookie "%s"' % item.get("name", ""))
+            if (item.get("url") or "").startswith("data:"):
+                raise errors.PageError('Data URL page can not have cookie "%s"' % item.get("name", ""))
+            items.append(item)
+        await self.deleteCookie(*items)
+        writes = []
+        for item in items:
+            item = dict(item)
             # ⛔ A session cookie goes WITHOUT `expires`: Juggler turns -1 into
             # an expiry in 1969 and drops the cookie silently (70-known-bugs
             # [B224] in the workbench).
             if item.get("expires") in (None, -1):
                 item.pop("expires", None)
-            items.append(item)
-        await _bridge.run(self._context._engine.set_cookies, items)
+            writes.append(item)
+        if writes:
+            await _bridge.run(self._context._engine.set_cookies, writes)
 
     async def deleteCookie(self, *cookies: dict) -> None:
-        """Deletes cookies by expiring them: Juggler can only clear a whole
-        context, which is more than this call asks for."""
-        current = await self.cookies()
+        """pyppeteer's `deleteCookie`, as Chrome's `Network.deleteCookies`:
+        the cookies with this name that would be sent to `url` (the page's
+        when none is given and the page is http(s)), or with exactly this
+        `domain`, and with exactly this `path` when one is given. Deleted by
+        expiring them: Juggler can only clear a whole context, which is more
+        than this call asks for."""
+        page_url = self.url
+        current = None
         doomed = []
         for spec in cookies:
+            spec = dict(spec)
+            if not spec.get("url") and page_url.startswith("http"):
+                spec["url"] = page_url
+            if not spec.get("url") and not spec.get("domain"):
+                raise errors.NetworkError(
+                    "Protocol error (Network.deleteCookies): At least one of "
+                    "the url and domain needs to be specified")
+            if current is None:
+                current = await _bridge.run(self._context._engine.cookies)
             for c in current:
                 if c.get("name") != spec.get("name"):
                     continue
-                if spec.get("domain") and spec["domain"] != c.get("domain"):
+                if spec.get("url") and not _sent_to(c, spec["url"]):
+                    continue
+                if spec.get("domain") and (c.get("domain") or "").lstrip(".") != spec["domain"].lstrip("."):
                     continue
                 if spec.get("path") and spec["path"] != c.get("path"):
                     continue
@@ -1163,11 +1433,24 @@ class Page(EventEmitter):
         """Resizes the viewport.
 
         ⛔ The profile already declares a viewport that agrees with its screen;
-        a different one is the caller's choice, and it is applied as asked."""
-        self._viewport = dict(viewport)
+        a different one is the caller's choice, and it is applied as asked.
+
+        `width` and `height` are checked as pyppeteer's `get_positive_int`
+        checks them: an int, not negative. `isMobile`, `hasTouch` and
+        `deviceScaleFactor` are not emulated: the session's profile declares
+        them, and a page that read a touch screen or a pixel ratio its screen
+        does not have would read a device that does not exist."""
+        size = {}
+        for name in ("width", "height"):
+            value = viewport[name]
+            if not isinstance(value, int):
+                raise TypeError("%s must be integer: %s" % (name, type(value)))
+            if value < 0:
+                raise ValueError("%s must be positive integer: %s" % (name, value))
+            size[name] = value
+        self._viewport = viewport
         await _bridge.run(self._engine.send, "Page.setViewportSize",
-                          {"viewportSize": {"width": int(viewport["width"]),
-                                            "height": int(viewport["height"])}})
+                          {"viewportSize": size})
 
     async def emulate(self, options: dict = None, **kwargs: Any) -> None:
         options = _bridge.merge(options, kwargs)
@@ -1247,7 +1530,17 @@ class Page(EventEmitter):
         await _bridge.run(self._engine.send, "Page.bringToFront", {})
 
     async def close(self, options: Dict = None, **kwargs: Any) -> None:
+        """pyppeteer's `close`. With `runBeforeUnload` the page runs its
+        `beforeunload` handlers and may ask (a `dialog` of type
+        `beforeunload`); it closes when that is accepted, and `close` is
+        emitted then. A page already closed raises, as pyppeteer's does once
+        its session is gone."""
+        options = _bridge.merge(options, kwargs)
         if self._closed:
+            raise errors.PageError("Protocol Error: Connection Closed. "
+                                   "Most likely the page has been closed.")
+        if options.get("runBeforeUnload"):
+            await _bridge.run(self._engine.send, "Page.close", {"runBeforeUnload": True})
             return
         self._closed = True
         await _bridge.run(self._engine.close)
